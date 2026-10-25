@@ -1,0 +1,17 @@
+services:
+  - type: web
+    name: upi-offline-mesh
+    runtime: docker
+    plan: free
+    healthCheckPath: /actuator/health
+    envVars:
+      - key: SPRING_PROFILES_ACTIVE
+        value: prod
+      - key: DB_URL          # jdbc:postgresql://HOST/DBNAME?sslmode=require
+        sync: false
+      - key: DB_USER
+        sync: false
+      - key: DB_PASS
+        sync: false
+      - key: UPI_RSA_PRIVATE_KEY   # output of: java scripts/GenerateRsaKey.java
+        sync: false
