@@ -6,7 +6,24 @@ This repo is the **server side** of that system, plus a software simulator of th
 
 ---
 
-> **PostgreSQL + free deployment (Render/Neon):** see [DEPLOYMENT.md](DEPLOYMENT.md).
+**Live demo:** https://upi-offline-mesh-e8np.onrender.com
+*(hosted on Render's free plan, so the first request after idle can take 30-60 seconds)*
+
+> Forked from [perryvegehan/UPI_Without_Internet](https://github.com/perryvegehan/UPI_Without_Internet). The mesh simulator, hybrid encryption and the idempotency design come from the original project.
+
+## What this fork adds
+
+| Area | Change |
+|---|---|
+| Database | PostgreSQL (Neon) in the `prod` profile. H2 is still used for local dev and the default tests. |
+| Schema | Flyway migration `V1__init_schema.sql`. Hibernate only *validates* the schema in prod. |
+| Server RSA key | Loaded from the `UPI_RSA_PRIVATE_KEY` environment variable, so it survives restarts. Startup fails in prod if it is missing. Generate one with `java scripts/GenerateRsaKey.java`. |
+| Idempotency | The in-memory gate is now backed by a ledger lookup and the unique index on `packet_hash`, so duplicates are still dropped after a restart or across instances. |
+| Deployment | `Dockerfile` (multi-stage, non-root), `docker-compose.yml`, `render.yaml`, `/actuator/health`. |
+| CI | GitHub Actions: tests on H2, tests on PostgreSQL + Flyway, and a Docker build. |
+| Hardening (prod) | H2 console off, error details hidden, graceful shutdown. |
+
+Deployment steps: see [DEPLOYMENT.md](DEPLOYMENT.md).
 
 ## Table of Contents
 
@@ -40,7 +57,7 @@ You'll see all three in the dashboard.
 ### Prerequisites
 
 - **JDK 17 or newer** installed and on PATH (or `JAVA_HOME` set). Check with `java -version`.
-- That's it. No database, no Redis, no Maven (the wrapper handles it). Just Java.
+- That's it for local dev. The default profile uses an in-memory H2 database, so no database, no Redis and no Maven install are needed (the wrapper handles it). For a local PostgreSQL run use `docker compose up --build` (see DEPLOYMENT.md).
 
 ### Run on Windows
 
@@ -228,9 +245,9 @@ return prev == null;  // true = first claimer, false = duplicate
 - The cleartext requires decryption first. We want to dedupe *before* spending CPU on RSA.
 - The ciphertext is authenticated by GCM, so any tampering is detectable on decrypt. Two legitimate deliveries of the same payment have byte-identical ciphertexts (AES is deterministic for a given key+IV+plaintext, and the same packet means the same key+IV+plaintext).
 
-In production this `ConcurrentHashMap` becomes Redis: `SET key NX EX 86400`. Same semantics, distributed across replicas.
+The `ConcurrentHashMap` is the fast first gate. It is lost on restart, so `BridgeIngestionService` also checks the ledger (`existsByPacketHash`) and handles a unique-index violation as a duplicate. For many replicas at scale this gate would move to Redis: `SET key NX EX 86400`.
 
-There's also a defense-in-depth fallback: `transactions.packet_hash` has a unique index. If the cache layer ever fails and two settlements somehow try to write the same hash, the database rejects the second one.
+The unique index on `transactions.packet_hash` is the final safety net: if two settlements ever try to write the same hash (for example on two instances), the database rejects the second one and the code reports it as a duplicate.
 
 ### Problem 3: Replay attacks
 
@@ -254,7 +271,9 @@ upi-offline-mesh/
 ├── README.md                                this file
 └── src/main/
     ├── resources/
-    │   ├── application.properties           H2 in-memory DB, port 8080, TTLs
+    │   ├── application.properties           H2 in-memory DB for dev, port 8080, TTLs
+    │   ├── application-prod.properties      PostgreSQL + Flyway + hardening (prod profile)
+    │   ├── db/migration/V1__init_schema.sql Flyway schema
     │   └── templates/dashboard.html         The interactive demo UI
     └── java/com/demo/upimesh/
         ├── UpiMeshApplication.java          Spring Boot main class
@@ -268,14 +287,14 @@ upi-offline-mesh/
         │   └── PaymentInstruction.java      Decrypted payload (sender/receiver/amount/nonce/time)
         │
         ├── crypto/                          ── Cryptography layer
-        │   ├── ServerKeyHolder.java         Generates RSA-2048 keypair on startup
+        │   ├── ServerKeyHolder.java         Loads RSA key from UPI_RSA_PRIVATE_KEY (dev: generates one)
         │   └── HybridCryptoService.java     RSA-OAEP + AES-256-GCM encrypt/decrypt + ciphertext hash
         │
         ├── service/                         ── Business logic
         │   ├── DemoService.java             Seeds accounts, simulates a sender phone
         │   ├── VirtualDevice.java           One simulated phone in the mesh
         │   ├── MeshSimulatorService.java    Gossip protocol across virtual devices
-        │   ├── IdempotencyService.java      ConcurrentHashMap = JVM-local Redis SETNX
+        │   ├── IdempotencyService.java      ConcurrentHashMap gate (ledger + unique index back it up)
         │   ├── SettlementService.java       @Transactional debit + credit + ledger insert
         │   └── BridgeIngestionService.java  THE pipeline: hash → claim → decrypt → freshness → settle
         │
@@ -306,9 +325,9 @@ src/test/java/com/demo/upimesh/
 | POST | `/api/mesh/flush` | Bridges with internet upload to backend (parallel) |
 | POST | `/api/mesh/reset` | Clear mesh + idempotency cache |
 | POST | `/api/bridge/ingest` | **The production endpoint.** Real bridges POST here |
-| GET | `/h2-console` | Browse the in-memory database |
+| GET | `/h2-console` | Browse the in-memory database (dev profile only) |
 
-H2 console login: JDBC URL `jdbc:h2:mem:upimesh`, username `sa`, no password.
+H2 console login (dev profile only): JDBC URL `jdbc:h2:mem:upimesh`, username `sa`, no password.
 
 ### Request format for `/api/bridge/ingest`
 
@@ -359,15 +378,15 @@ This is a teaching demo. To make it production-grade you'd swap these things:
 
 | What's in the demo | What it would be in production |
 |---|---|
-| H2 in-memory DB | PostgreSQL / MySQL with replicas |
-| `ConcurrentHashMap` for idempotency | Redis with `SET NX EX` |
-| RSA keypair regenerated on every startup | Private key in HSM (AWS KMS, HashiCorp Vault). Public key cached on devices. |
+| PostgreSQL on Neon free tier (H2 in dev) | Managed PostgreSQL with replicas, backups, PITR |
+| `ConcurrentHashMap` + ledger check + unique index | Redis with `SET NX EX` in front of the same DB index |
+| RSA private key in an environment variable | Private key in HSM (AWS KMS, HashiCorp Vault). Public key cached on devices. |
 | Server-side `DemoService.createPacket()` | Same code running on Android, in a Kotlin port |
 | Software-simulated mesh (`MeshSimulatorService`) | Real BLE GATT or Wi-Fi Direct between phones |
 | One settlement service that owns the ledger | Integration with NPCI / a real bank core |
 | No auth on `/api/bridge/ingest` | Mutual TLS or signed bridge-node certificates |
 | In-memory accounts seeded on startup | Real KYC'd users, real VPAs, real PIN verification against the bank |
-| H2 console exposed | Disabled |
+| H2 console on in dev only | Disabled (already off in the prod profile) |
 | No rate limiting | Per-bridge-node rate limit, per-sender velocity check |
 | Logs to console | Structured logs to a SIEM, alerts on `INVALID` spikes |
 
