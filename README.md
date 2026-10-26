@@ -9,9 +9,6 @@ This repo is the **server side** of that system, plus a software simulator of th
 **Live demo:** https://upi-offline-mesh-e8np.onrender.com
 *(hosted on Render's free plan, so the first request after idle can take 30-60 seconds)*
 
-> Forked from [perryvegehan/UPI_Without_Internet](https://github.com/perryvegehan/UPI_Without_Internet). The mesh simulator, hybrid encryption and the idempotency design come from the original project.
-
-## What this fork adds
 
 | Area | Change |
 |---|---|
